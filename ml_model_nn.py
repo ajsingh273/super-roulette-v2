@@ -1,21 +1,16 @@
 import numpy as np
-import pandas as pd
-import joblib
-from sklearn.model_selection import train_test_split
+import pickle
+import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
-import os
+from sklearn.model_selection import train_test_split
+from keras.models import Sequential
+from keras.layers import Dense, LSTM
 
-# Define the zones for American Roulette (0 and 00 included)
-LEFT_ZONE = {0, 28, 9, 26, 30, 11, 7, 20, 32, 17, 5, 22}
-RIGHT_ZONE = {00, 27, 10, 25, 29, 12, 8, 19, 31, 18, 6, 21}
-BOTTOM_ZONE = {33, 16, 4, 23, 35, 14, 2, 13, 1, 36, 24, 3, 15, 34}
+# Constants for zone categorization (example)
+LEFT_ZONE = list(range(1, 13))
+RIGHT_ZONE = list(range(13, 25))
+BOTTOM_ZONE = list(range(25, 37))
 
-# -------------------------------
-# Feature Engineering with Debugging
-# -------------------------------
 def feature_engineering(spins):
     if len(spins) < 10:
         return None
@@ -63,6 +58,9 @@ def feature_engineering(spins):
 
     # Ensuring we return exactly 50 features
     expected_feature_count = 50
+    current_feature_count = len(features)
+
+    # If the number of features is less than expected, add additional features
     while len(features) < expected_feature_count:
         features[f'additional_feature_{len(features)}'] = 0  # Filling any missing features if necessary
 
@@ -70,78 +68,75 @@ def feature_engineering(spins):
     print(f"Number of features generated: {len(features)}")
     return features
 
-# -------------------------------
-# Train Neural Network Model
-# -------------------------------
-def train_model():
-    print("Training NN model...")
-
-    X_data, y_data = [], []
-
-    for _ in range(5000):
-        spins = np.random.choice(range(1, 37), size=50, replace=True).tolist()
-        features = feature_engineering(spins)
+def train_model(spins):
+    X = []
+    y = []
+    
+    # Generate features and labels
+    for i in range(10, len(spins)):
+        features = feature_engineering(spins[i-10:i])
         if features:
-            X_data.append(list(features.values()))
-            next_spin = np.random.randint(1, 37)
-            if 1 <= next_spin <= 12:
-                y_data.append(0)
-            elif 13 <= next_spin <= 24:
-                y_data.append(1)
-            else:
-                y_data.append(2)
+            X.append(list(features.values()))
+            y.append(spins[i])  # Target is the next spin
 
-    feature_names = list(feature_engineering(list(range(1, 51))).keys())
-    df = pd.DataFrame(X_data, columns=feature_names)
-    labels = pd.Series(y_data)
+    # Convert to numpy arrays
+    X = np.array(X)
+    y = np.array(y)
 
-    X_train, X_test, y_train, y_test = train_test_split(df, labels, test_size=0.2, random_state=42)
+    # Scale the features
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_scaled = scaler.fit_transform(X)
 
-    model = Sequential([
-        Dense(128, activation='relu', input_shape=(X_train_scaled.shape[1],)),
-        Dropout(0.3),
-        Dense(64, activation='relu'),
-        Dropout(0.3),
-        Dense(32, activation='relu'),
-        Dense(3, activation='softmax')
-    ])
+    # Reshape data for LSTM (samples, time steps, features)
+    X_scaled = X_scaled.reshape(X_scaled.shape[0], 1, X_scaled.shape[1])
 
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    model.fit(X_train_scaled, y_train, epochs=25, batch_size=32, validation_split=0.2, verbose=1)
+    # Split into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-    y_pred = np.argmax(model.predict(X_test_scaled), axis=1)
-    print(classification_report(y_test, y_pred))
+    # Define LSTM model
+    model = Sequential()
+    model.add(LSTM(50, activation='relu', input_shape=(X_train.shape[1], X_train.shape[2])))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='mean_squared_error')
 
-    model.save('roulette_nn_model.h5')
-    joblib.dump(scaler, 'scaler_nn.pkl')
+    # Train the model
+    model.fit(X_train, y_train, epochs=10, batch_size=32, validation_data=(X_test, y_test))
 
-    print("✅ NN model and scaler saved.")
+    # Save the model and scaler
+    model.save('lstm_next_spin_model.h5')
+    with open('scaler_nn.pkl', 'wb') as f:
+        pickle.dump(scaler, f)
 
-# -------------------------------
-# Prediction Function
-# -------------------------------
-def predict_next_spin(spins):
+def predict_next_spins(spins):
+    # Load the trained model and scaler
+    with open('scaler_nn.pkl', 'rb') as model_file:
+        scaler = pickle.load(model_file)
+    
+    model = tf.keras.models.load_model('lstm_next_spin_model.h5')
+
+    # Prepare the input features
     features = feature_engineering(spins)
-    if features is None:
-        return "Not enough data to predict"
-    
-    # Ensure that the features are the same as those used in training
-    print(f"Number of features in prediction: {len(features)}")
-    
-    # Preprocess the features just like we did during training
-    features_array = np.array(list(features.values())).reshape(1, -1)
-    features_scaled = scaler.transform(features_array)  # Use the trained scaler
-    
-    # Predict using the trained model
-    prediction = model.predict(features_scaled)
-    predicted_class = np.argmax(prediction, axis=1)[0]
+    if not features:
+        return None
 
-    if predicted_class == 0:
-        return "Left Zone"
-    elif predicted_class == 1:
-        return "Right Zone"
-    else:
-        return "Bottom Zone"
+    # Scale the features
+    features_scaled = scaler.transform([list(features.values())])
+
+    # Reshape input to match LSTM expected input
+    features_scaled = features_scaled.reshape(1, 1, features_scaled.shape[1])
+
+    # Predict the next spin
+    prediction = model.predict(features_scaled)
+    return prediction[0][0]
+
+# Sample usage
+if __name__ == "__main__":
+    # Example spins data
+    spins_data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 1, 2, 3, 4, 5]
+
+    # Train the model
+    train_model(spins_data)
+
+    # Predict the next spin
+    next_spin_prediction = predict_next_spins(spins_data)
+    print(f"Predicted next spin: {next_spin_prediction}")
